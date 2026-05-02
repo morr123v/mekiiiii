@@ -1,0 +1,105 @@
+name: Full Ubuntu GNOME + RDP + Tailscale + AnythingLLM + Ollama (Fixed)
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  setup-full:
+    runs-on: ubuntu-latest
+    env:
+      TAILSCALE_AUTHKEY: ${{ secrets.TAILSCALE_AUTHKEY }}
+      USERNAME: runner
+      PASSWORD: runner
+      TAILSCALE_HOSTNAME: ubuntu-full-anythingllm-${{ github.run_id }}
+      OLLAMA_MODEL: llama3.2:1b
+      ANYTHINGLLM_PORT: 3001
+      STORAGE_LOCATION: /home/runner/anythingllm_data
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set user password and sudo
+        run: |
+          echo "${USERNAME}:${PASSWORD}" | sudo chpasswd
+          echo "${USERNAME} ALL=(ALL) NOPASSWD:ALL" | sudo tee /etc/sudoers.d/${USERNAME}
+
+      - name: Install Ubuntu Desktop (GNOME) + xrdp
+        run: |
+          sudo apt-get update -qq
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq ubuntu-desktop-minimal xrdp
+          echo "gnome-session" | sudo tee /home/${USERNAME}/.xsession
+          sudo chown ${USERNAME}:${USERNAME} /home/${USERNAME}/.xsession
+          sudo systemctl enable --now xrdp
+          sudo systemctl restart xrdp
+
+      - name: Install Tailscale
+        run: |
+          curl -fsSL https://tailscale.com/install.sh | sudo sh
+          sudo tailscale up --authkey "${TAILSCALE_AUTHKEY}" --hostname "${TAILSCALE_HOSTNAME}"
+
+      - name: Install Docker
+        run: |
+          curl -fsSL https://get.docker.com | sudo sh
+          sudo usermod -aG docker ${USERNAME}
+          sudo systemctl start docker
+
+      - name: Install Ollama
+        run: |
+          curl -fsSL https://ollama.com/install.sh | sh
+          sudo systemctl start ollama
+          sudo systemctl enable ollama
+          sleep 15
+          ollama pull ${OLLAMA_MODEL}
+          ollama list
+
+      - name: Create storage directory and deploy AnythingLLM
+        run: |
+          # Create directory with correct permissions
+          sudo mkdir -p ${STORAGE_LOCATION}
+          sudo chown -R ${USERNAME}:${USERNAME} ${STORAGE_LOCATION}
+          
+          # Remove old container if exists
+          docker rm -f anythingllm 2>/dev/null || true
+          
+          # Run container with simplified volume mapping
+          docker run -d \
+            -p ${ANYTHINGLLM_PORT}:3001 \
+            -v ${STORAGE_LOCATION}:/app/server/storage \
+            --name anythingllm \
+            --restart=unless-stopped \
+            mintplexlabs/anythingllm
+          
+          # Wait and check logs
+          sleep 10
+          echo "=== AnythingLLM Logs ==="
+          docker logs anythingllm --tail 30
+          
+          # Test health
+          for i in {1..20}; do
+            if curl -s -f -o /dev/null http://localhost:${ANYTHINGLLM_PORT}; then
+              echo "AnythingLLM is up on port ${ANYTHINGLLM_PORT}"
+              break
+            fi
+            echo "Attempt $i/20 failed. Retrying in 3 seconds..."
+            sleep 3
+          done
+
+      - name: Connection Information
+        run: |
+          TS_IP=$(sudo tailscale ip -4 | head -n1 | tr -d ' ')
+          echo "============================================================"
+          echo "           FULL SETUP READY - ANYTHINGLLM                   "
+          echo "============================================================"
+          echo "RDP: ${TS_IP}:3389 (user: ${USERNAME} / pass: ${PASSWORD})"
+          echo "AnythingLLM: http://${TS_IP}:${ANYTHINGLLM_PORT}"
+          echo "Ollama API: http://${TS_IP}:11434 (model: ${OLLAMA_MODEL})"
+          echo ""
+          echo "Inside AnythingLLM, configure Ollama as:"
+          echo "  Base URL: http://host.docker.internal:11434"
+          echo "============================================================"
+
+      - name: Keep Runner Alive
+        run: while true; do sleep 600; done
